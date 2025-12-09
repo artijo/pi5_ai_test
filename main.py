@@ -13,6 +13,7 @@ import json
 import signal
 import sys
 import time
+import subprocess
 import numpy as np
 from datetime import datetime
 from pathlib import Path
@@ -38,9 +39,144 @@ except ImportError:
 try:
     from picamera2 import Picamera2
     PICAMERA_AVAILABLE = True
+    print("picamera2 is available")
 except ImportError:
-    print("Warning: picamera2 not available. Using OpenCV camera.")
+    print("Warning: picamera2 not available. Will try libcamera/OpenCV.")
     PICAMERA_AVAILABLE = False
+
+
+class LibcameraCapture:
+    """
+    Capture frames using libcamera-vid and pipe to OpenCV
+    This works when rpicam-hello works but picamera2 is not installed
+    """
+    def __init__(self, width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.process = None
+        self.running = False
+        
+    def start(self):
+        """Start the libcamera capture process"""
+        cmd = [
+            'libcamera-vid',
+            '--inline',
+            '--nopreview',
+            '-t', '0',  # Run indefinitely
+            '--width', str(self.width),
+            '--height', str(self.height),
+            '--framerate', str(self.fps),
+            '--codec', 'mjpeg',
+            '-o', '-'  # Output to stdout
+        ]
+        
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10**8
+            )
+            self.running = True
+            print(f"libcamera-vid started: {self.width}x{self.height}@{self.fps}fps")
+            return True
+        except Exception as e:
+            print(f"Failed to start libcamera-vid: {e}")
+            return False
+            
+    def read(self):
+        """Read a frame from the libcamera stream"""
+        if not self.running or self.process is None:
+            return False, None
+            
+        try:
+            # Read JPEG data from pipe
+            # JPEG starts with 0xFFD8 and ends with 0xFFD9
+            jpeg_data = b''
+            while True:
+                byte = self.process.stdout.read(1)
+                if not byte:
+                    return False, None
+                jpeg_data += byte
+                
+                # Check for JPEG start marker
+                if len(jpeg_data) >= 2 and jpeg_data[-2:] == b'\xff\xd8':
+                    jpeg_data = b'\xff\xd8'
+                    
+                # Check for JPEG end marker
+                if len(jpeg_data) > 2 and jpeg_data[-2:] == b'\xff\xd9':
+                    break
+                    
+                # Safety limit
+                if len(jpeg_data) > 10**7:
+                    return False, None
+                    
+            # Decode JPEG to frame
+            frame = cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is not None:
+                return True, frame
+                
+        except Exception as e:
+            print(f"Error reading frame: {e}")
+            
+        return False, None
+        
+    def release(self):
+        """Stop the capture process"""
+        self.running = False
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+            self.process = None
+            
+    def isOpened(self):
+        return self.running and self.process is not None
+
+
+class GStreamerCapture:
+    """
+    Capture frames using GStreamer pipeline with libcamera
+    More efficient than raw pipe method
+    """
+    def __init__(self, width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.cap = None
+        
+    def start(self):
+        """Start GStreamer capture"""
+        # GStreamer pipeline for libcamera on Pi5
+        gst_pipeline = (
+            f'libcamerasrc ! '
+            f'video/x-raw,width={self.width},height={self.height},framerate={self.fps}/1 ! '
+            f'videoconvert ! '
+            f'video/x-raw,format=BGR ! '
+            f'appsink drop=1'
+        )
+        
+        try:
+            self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+            if self.cap.isOpened():
+                print(f"GStreamer capture started: {self.width}x{self.height}@{self.fps}fps")
+                return True
+        except Exception as e:
+            print(f"GStreamer failed: {e}")
+            
+        return False
+        
+    def read(self):
+        if self.cap:
+            return self.cap.read()
+        return False, None
+        
+    def release(self):
+        if self.cap:
+            self.cap.release()
+            
+    def isOpened(self):
+        return self.cap is not None and self.cap.isOpened()
 
 
 class BusPassengerCounter:
@@ -65,6 +201,7 @@ class BusPassengerCounter:
         
         # Initialize camera
         self.camera = None
+        self.camera_type = None  # 'picamera2', 'gstreamer', 'libcamera', 'opencv'
         self.init_camera()
         
         # Initialize AI model
@@ -83,46 +220,99 @@ class BusPassengerCounter:
         
     def init_camera(self):
         """Initialize camera (Pi Camera or USB camera)"""
-        self.use_picamera = False
+        print("\n" + "="*50)
+        print("INITIALIZING CAMERA")
+        print("="*50)
         
+        # Method 1: Try picamera2
         if PICAMERA_AVAILABLE:
             try:
+                print("Trying picamera2...")
                 self.camera = Picamera2()
                 config = self.camera.create_preview_configuration(
                     main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
                 )
                 self.camera.configure(config)
-                self.use_picamera = True
-                print(f"Pi Camera initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+                self.camera_type = 'picamera2'
+                print(f"✓ picamera2 initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
                 return
             except Exception as e:
-                print(f"Failed to initialize Pi Camera: {e}")
+                print(f"✗ picamera2 failed: {e}")
                 self.camera = None
+        
+        # Method 2: Try GStreamer with libcamera
+        print("Trying GStreamer with libcamera...")
+        gst_cap = GStreamerCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+        if gst_cap.start():
+            ret, test_frame = gst_cap.read()
+            if ret and test_frame is not None:
+                self.camera = gst_cap
+                self.camera_type = 'gstreamer'
+                print(f"✓ GStreamer initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+                return
+            gst_cap.release()
+        print("✗ GStreamer failed")
+        
+        # Method 3: Try OpenCV with V4L2 (for Pi Camera)
+        print("Trying OpenCV with V4L2...")
+        for dev in ['/dev/video0', '/dev/video1', '/dev/video2']:
+            try:
+                cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+                    ret, test_frame = cap.read()
+                    if ret and test_frame is not None:
+                        self.camera = cap
+                        self.camera_type = 'opencv'
+                        print(f"✓ OpenCV V4L2 initialized on {dev}: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+                        return
+                    cap.release()
+            except Exception as e:
+                print(f"  {dev}: {e}")
                 
-        # Fallback to OpenCV camera - try multiple indices
-        print("Trying OpenCV camera...")
-        for camera_index in [0, 1, 2, -1]:
-            print(f"  Trying camera index {camera_index}...")
-            self.camera = cv2.VideoCapture(camera_index)
-            
-            if self.camera is not None and self.camera.isOpened():
-                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-                self.camera.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+        # Method 4: Try libcamera-vid pipe
+        print("Trying libcamera-vid pipe...")
+        libcam = LibcameraCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+        if libcam.start():
+            time.sleep(1)  # Wait for camera to start
+            ret, test_frame = libcam.read()
+            if ret and test_frame is not None:
+                self.camera = libcam
+                self.camera_type = 'libcamera'
+                print(f"✓ libcamera-vid initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+                return
+            libcam.release()
+        print("✗ libcamera-vid failed")
                 
-                # Test read a frame
-                ret, test_frame = self.camera.read()
-                if ret and test_frame is not None:
-                    print(f"OpenCV Camera initialized on index {camera_index}: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-                    return
-                else:
-                    self.camera.release()
+        # Method 5: Try regular OpenCV
+        print("Trying OpenCV default...")
+        for camera_index in [0, 1, 2]:
+            try:
+                cap = cv2.VideoCapture(camera_index)
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+                    ret, test_frame = cap.read()
+                    if ret and test_frame is not None:
+                        self.camera = cap
+                        self.camera_type = 'opencv'
+                        print(f"✓ OpenCV initialized on index {camera_index}")
+                        return
+                    cap.release()
+            except:
+                pass
                     
-        print("Error: Could not open any camera!")
-        print("Please check:")
-        print("  1. Camera is connected properly")
-        print("  2. Run 'rpicam-hello' to test Pi Camera")
-        print("  3. Run 'ls /dev/video*' to check available cameras")
+        print("\n" + "="*50)
+        print("ERROR: Could not initialize any camera!")
+        print("="*50)
+        print("Please try:")
+        print("  1. sudo apt install python3-picamera2")
+        print("  2. Check: ls /dev/video*")
+        print("  3. Test: rpicam-hello -t 2000")
+        print("="*50)
         self.camera = None
             
     def init_hailo_model(self):
@@ -160,12 +350,13 @@ class BusPassengerCounter:
             return None
             
         try:
-            if self.use_picamera and isinstance(self.camera, Picamera2):
+            if self.camera_type == 'picamera2':
                 frame = self.camera.capture_array()
                 # Convert RGB to BGR for OpenCV
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 return frame
             else:
+                # Works for opencv, gstreamer, libcamera
                 ret, frame = self.camera.read()
                 if ret and frame is not None:
                     return frame
@@ -365,7 +556,7 @@ class BusPassengerCounter:
         
         # Close camera
         try:
-            if self.use_picamera and isinstance(self.camera, Picamera2):
+            if self.camera_type == 'picamera2':
                 self.camera.stop()
                 self.camera.close()
             elif self.camera is not None:
@@ -395,10 +586,12 @@ class BusPassengerCounter:
             self.cleanup()
             return
         
-        # Start camera if Pi Camera
-        if self.use_picamera and isinstance(self.camera, Picamera2):
+        # Start camera if picamera2
+        if self.camera_type == 'picamera2':
             self.camera.start()
             time.sleep(0.5)  # Wait for camera to warm up
+        elif self.camera_type == 'libcamera':
+            time.sleep(0.5)  # Already started, just wait
             
         frame_error_count = 0
         max_frame_errors = 50  # Stop after 50 consecutive errors
