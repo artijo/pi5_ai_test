@@ -45,6 +45,84 @@ except ImportError:
     PICAMERA_AVAILABLE = False
 
 
+class RpicamRawCapture:
+    """
+    Ultra low-latency capture using rpicam-vid raw output
+    Reads raw YUV frames directly - fastest method
+    """
+    def __init__(self, width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.process = None
+        self.running = False
+        self.frame_size = int(width * height * 1.5)  # YUV420 = 1.5 bytes per pixel
+        
+    def start(self):
+        """Start rpicam-vid with raw YUV output to pipe"""
+        for cmd_name in ['rpicam-vid', 'libcamera-vid']:
+            try:
+                cmd = [
+                    cmd_name,
+                    '--nopreview',
+                    '-t', '0',
+                    '--width', str(self.width),
+                    '--height', str(self.height),
+                    '--framerate', str(self.fps),
+                    '--codec', 'yuv420',
+                    '--flush',
+                    '-o', '-'
+                ]
+                
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=self.frame_size * 2
+                )
+                self.running = True
+                print(f"{cmd_name} raw capture started: {self.width}x{self.height}@{self.fps}fps")
+                return True
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"Failed: {e}")
+                continue
+        return False
+        
+    def read(self):
+        """Read a raw YUV frame and convert to BGR"""
+        if not self.running or self.process is None:
+            return False, None
+            
+        try:
+            # Read exact frame size
+            raw_data = self.process.stdout.read(self.frame_size)
+            if len(raw_data) != self.frame_size:
+                return False, None
+                
+            # Convert YUV420 to BGR
+            yuv = np.frombuffer(raw_data, dtype=np.uint8).reshape((int(self.height * 1.5), self.width))
+            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+            return True, frame
+            
+        except Exception as e:
+            return False, None
+            
+    def release(self):
+        self.running = False
+        if self.process:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except:
+                self.process.kill()
+            self.process = None
+            
+    def isOpened(self):
+        return self.running and self.process is not None
+
+
 class LibcameraCapture:
     """
     Capture frames using rpicam-vid (Pi5) or libcamera-vid and pipe to OpenCV
@@ -139,8 +217,7 @@ class LibcameraCapture:
 
 class RpicamTcpCapture:
     """
-    Capture frames using rpicam-vid with TCP output
-    More reliable than pipe method
+    Capture frames using rpicam-vid with TCP output - LOW LATENCY version
     """
     def __init__(self, width=640, height=480, fps=30, port=8888):
         self.width = width
@@ -167,12 +244,19 @@ class RpicamTcpCapture:
         # Try rpicam-vid first, then libcamera-vid
         for cmd_name in ['rpicam-vid', 'libcamera-vid']:
             try:
+                # Low latency settings
                 cmd = [
-                    cmd_name, '--inline', '--nopreview', '-t', '0',
-                    '--width', str(self.width), '--height', str(self.height),
+                    cmd_name, 
+                    '--inline',
+                    '--nopreview', 
+                    '-t', '0',
+                    '--width', str(self.width), 
+                    '--height', str(self.height),
                     '--framerate', str(self.fps),
-                    '--codec', 'mjpeg',
-                    '--listen', '-o', f'tcp://0.0.0.0:{self.port}'
+                    '--codec', 'yuv420',  # Raw format = lowest latency
+                    '--flush',  # Flush output immediately
+                    '--listen', 
+                    '-o', f'tcp://0.0.0.0:{self.port}'
                 ]
                 
                 self.process = subprocess.Popen(
@@ -315,7 +399,7 @@ class BusPassengerCounter:
         print("INITIALIZING CAMERA")
         print("="*50)
         
-        # Method 1: Try picamera2
+        # Method 1: Try picamera2 (best option)
         if PICAMERA_AVAILABLE:
             try:
                 print("Trying picamera2...")
@@ -331,7 +415,21 @@ class BusPassengerCounter:
                 print(f"✗ picamera2 failed: {e}")
                 self.camera = None
         
-        # Method 2: Try GStreamer with libcamera
+        # Method 2: Try rpicam-vid raw capture (lowest latency without picamera2)
+        print("Trying rpicam-vid raw capture (low latency)...")
+        raw_cap = RpicamRawCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+        if raw_cap.start():
+            time.sleep(0.5)
+            ret, test_frame = raw_cap.read()
+            if ret and test_frame is not None:
+                self.camera = raw_cap
+                self.camera_type = 'rpicam_raw'
+                print(f"✓ rpicam-vid raw initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+                return
+            raw_cap.release()
+        print("✗ rpicam-vid raw failed")
+        
+        # Method 3: Try GStreamer with libcamera
         print("Trying GStreamer with libcamera...")
         gst_cap = GStreamerCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
         if gst_cap.start():
@@ -692,7 +790,7 @@ class BusPassengerCounter:
         if self.camera_type == 'picamera2':
             self.camera.start()
             time.sleep(0.5)  # Wait for camera to warm up
-        elif self.camera_type == 'libcamera':
+        elif self.camera_type in ['libcamera', 'rpicam_raw', 'rpicam_tcp']:
             time.sleep(0.5)  # Already started, just wait
             
         frame_error_count = 0
@@ -701,10 +799,27 @@ class BusPassengerCounter:
         fps_counter = 0
         fps_start_time = time.time()
         current_fps = 0
+        frame_count = 0
+        
+        print(f"Camera type: {self.camera_type}")
+        print("Starting capture loop...")
         
         while self.running:
-            # Get frame
-            frame = self.get_frame()
+            # Get frame - flush old frames for lower latency
+            frame = None
+            
+            # For raw/tcp capture, read multiple frames to get latest
+            if self.camera_type in ['rpicam_raw', 'rpicam_tcp']:
+                # Try to get the most recent frame by reading quickly
+                for _ in range(2):  # Read up to 2 frames to flush buffer
+                    ret, new_frame = self.camera.read() if hasattr(self.camera, 'read') else (None, None)
+                    if ret and new_frame is not None:
+                        frame = new_frame
+                if frame is None:
+                    frame = self.get_frame()
+            else:
+                frame = self.get_frame()
+                
             if frame is None:
                 frame_error_count += 1
                 if frame_error_count >= max_frame_errors:
@@ -712,11 +827,12 @@ class BusPassengerCounter:
                     break
                 if frame_error_count % 10 == 1:
                     print(f"Warning: Could not get frame (error #{frame_error_count})")
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
             
             # Reset error count on successful frame
             frame_error_count = 0
+            frame_count += 1
                 
             # Process frame
             frame, boxes, objects, count_in, count_out = self.process_frame(frame)

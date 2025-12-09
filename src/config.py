@@ -7,6 +7,10 @@ CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 
+# Low latency settings
+LOW_LATENCY_MODE = True  # Enable low latency camera mode
+SKIP_FRAMES = 0  # Skip frames to reduce latency (0 = no skip)
+
 # Detection settings
 CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence for person detection
 NMS_THRESHOLD = 0.4  # Non-maximum suppression threshold
