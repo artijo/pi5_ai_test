@@ -47,7 +47,7 @@ except ImportError:
 
 class LibcameraCapture:
     """
-    Capture frames using libcamera-vid and pipe to OpenCV
+    Capture frames using rpicam-vid (Pi5) or libcamera-vid and pipe to OpenCV
     This works when rpicam-hello works but picamera2 is not installed
     """
     def __init__(self, width=640, height=480, fps=30):
@@ -58,32 +58,35 @@ class LibcameraCapture:
         self.running = False
         
     def start(self):
-        """Start the libcamera capture process"""
-        cmd = [
-            'libcamera-vid',
-            '--inline',
-            '--nopreview',
-            '-t', '0',  # Run indefinitely
-            '--width', str(self.width),
-            '--height', str(self.height),
-            '--framerate', str(self.fps),
-            '--codec', 'mjpeg',
-            '-o', '-'  # Output to stdout
+        """Start the rpicam/libcamera capture process"""
+        # Try rpicam-vid first (Pi5 with Bookworm), then libcamera-vid
+        commands_to_try = [
+            ['rpicam-vid', '--inline', '--nopreview', '-t', '0',
+             '--width', str(self.width), '--height', str(self.height),
+             '--framerate', str(self.fps), '--codec', 'mjpeg', '-o', '-'],
+            ['libcamera-vid', '--inline', '--nopreview', '-t', '0',
+             '--width', str(self.width), '--height', str(self.height),
+             '--framerate', str(self.fps), '--codec', 'mjpeg', '-o', '-'],
         ]
         
-        try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=10**8
-            )
-            self.running = True
-            print(f"libcamera-vid started: {self.width}x{self.height}@{self.fps}fps")
-            return True
-        except Exception as e:
-            print(f"Failed to start libcamera-vid: {e}")
-            return False
+        for cmd in commands_to_try:
+            try:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=10**8
+                )
+                self.running = True
+                print(f"{cmd[0]} started: {self.width}x{self.height}@{self.fps}fps")
+                return True
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"Failed to start {cmd[0]}: {e}")
+                continue
+                
+        return False
             
     def read(self):
         """Read a frame from the libcamera stream"""
@@ -132,6 +135,94 @@ class LibcameraCapture:
             
     def isOpened(self):
         return self.running and self.process is not None
+
+
+class RpicamTcpCapture:
+    """
+    Capture frames using rpicam-vid with TCP output
+    More reliable than pipe method
+    """
+    def __init__(self, width=640, height=480, fps=30, port=8888):
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.port = port
+        self.process = None
+        self.cap = None
+        self.running = False
+        
+    def start(self):
+        """Start rpicam-vid with TCP output and connect OpenCV"""
+        import socket
+        
+        # Find available port
+        for port in range(self.port, self.port + 10):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            if result != 0:  # Port is available
+                self.port = port
+                break
+        
+        # Try rpicam-vid first, then libcamera-vid
+        for cmd_name in ['rpicam-vid', 'libcamera-vid']:
+            try:
+                cmd = [
+                    cmd_name, '--inline', '--nopreview', '-t', '0',
+                    '--width', str(self.width), '--height', str(self.height),
+                    '--framerate', str(self.fps),
+                    '--codec', 'mjpeg',
+                    '--listen', '-o', f'tcp://0.0.0.0:{self.port}'
+                ]
+                
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                
+                # Wait for server to start
+                time.sleep(2)
+                
+                # Connect OpenCV to TCP stream
+                self.cap = cv2.VideoCapture(f'tcp://127.0.0.1:{self.port}')
+                if self.cap.isOpened():
+                    ret, frame = self.cap.read()
+                    if ret and frame is not None:
+                        self.running = True
+                        print(f"{cmd_name} TCP started on port {self.port}: {self.width}x{self.height}@{self.fps}fps")
+                        return True
+                        
+                # If failed, cleanup and try next
+                if self.cap:
+                    self.cap.release()
+                if self.process:
+                    self.process.terminate()
+                    self.process.wait()
+                    
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                print(f"TCP capture failed with {cmd_name}: {e}")
+                continue
+                
+        return False
+        
+    def read(self):
+        if self.cap and self.running:
+            return self.cap.read()
+        return False, None
+        
+    def release(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        if self.process:
+            self.process.terminate()
+            self.process.wait()
+            
+    def isOpened(self):
+        return self.running and self.cap is not None and self.cap.isOpened()
 
 
 class GStreamerCapture:
@@ -253,7 +344,17 @@ class BusPassengerCounter:
             gst_cap.release()
         print("✗ GStreamer failed")
         
-        # Method 3: Try OpenCV with V4L2 (for Pi Camera)
+        # Method 3: Try rpicam-vid with TCP (most reliable for Pi5)
+        print("Trying rpicam-vid with TCP...")
+        tcp_cap = RpicamTcpCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+        if tcp_cap.start():
+            self.camera = tcp_cap
+            self.camera_type = 'rpicam_tcp'
+            print(f"✓ rpicam-vid TCP initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+            return
+        print("✗ rpicam-vid TCP failed")
+        
+        # Method 4: Try OpenCV with V4L2 (for Pi Camera)
         print("Trying OpenCV with V4L2...")
         for dev in ['/dev/video0', '/dev/video1', '/dev/video2']:
             try:
@@ -272,8 +373,8 @@ class BusPassengerCounter:
             except Exception as e:
                 print(f"  {dev}: {e}")
                 
-        # Method 4: Try libcamera-vid pipe
-        print("Trying libcamera-vid pipe...")
+        # Method 5: Try rpicam-vid/libcamera-vid pipe
+        print("Trying rpicam-vid pipe...")
         libcam = LibcameraCapture(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
         if libcam.start():
             time.sleep(1)  # Wait for camera to start
@@ -281,12 +382,12 @@ class BusPassengerCounter:
             if ret and test_frame is not None:
                 self.camera = libcam
                 self.camera_type = 'libcamera'
-                print(f"✓ libcamera-vid initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+                print(f"✓ rpicam-vid pipe initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
                 return
             libcam.release()
-        print("✗ libcamera-vid failed")
+        print("✗ rpicam-vid pipe failed")
                 
-        # Method 5: Try regular OpenCV
+        # Method 6: Try regular OpenCV
         print("Trying OpenCV default...")
         for camera_index in [0, 1, 2]:
             try:
@@ -309,9 +410,10 @@ class BusPassengerCounter:
         print("ERROR: Could not initialize any camera!")
         print("="*50)
         print("Please try:")
-        print("  1. sudo apt install python3-picamera2")
-        print("  2. Check: ls /dev/video*")
-        print("  3. Test: rpicam-hello -t 2000")
+        print("  1. sudo apt install -y python3-picamera2 python3-libcamera")
+        print("  2. pip install picamera2 (in venv with --system-site-packages)")
+        print("  3. Check: ls /dev/video*")
+        print("  4. Test: rpicam-hello -t 2000")
         print("="*50)
         self.camera = None
             
