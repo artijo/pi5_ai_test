@@ -83,6 +83,8 @@ class BusPassengerCounter:
         
     def init_camera(self):
         """Initialize camera (Pi Camera or USB camera)"""
+        self.use_picamera = False
+        
         if PICAMERA_AVAILABLE:
             try:
                 self.camera = Picamera2()
@@ -90,21 +92,38 @@ class BusPassengerCounter:
                     main={"size": (CAMERA_WIDTH, CAMERA_HEIGHT), "format": "RGB888"}
                 )
                 self.camera.configure(config)
+                self.use_picamera = True
                 print(f"Pi Camera initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
                 return
             except Exception as e:
                 print(f"Failed to initialize Pi Camera: {e}")
+                self.camera = None
                 
-        # Fallback to OpenCV camera
-        self.camera = cv2.VideoCapture(0)
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        self.camera.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-        
-        if self.camera.isOpened():
-            print(f"OpenCV Camera initialized: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-        else:
-            print("Error: Could not open camera!")
+        # Fallback to OpenCV camera - try multiple indices
+        print("Trying OpenCV camera...")
+        for camera_index in [0, 1, 2, -1]:
+            print(f"  Trying camera index {camera_index}...")
+            self.camera = cv2.VideoCapture(camera_index)
+            
+            if self.camera is not None and self.camera.isOpened():
+                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                self.camera.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+                
+                # Test read a frame
+                ret, test_frame = self.camera.read()
+                if ret and test_frame is not None:
+                    print(f"OpenCV Camera initialized on index {camera_index}: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+                    return
+                else:
+                    self.camera.release()
+                    
+        print("Error: Could not open any camera!")
+        print("Please check:")
+        print("  1. Camera is connected properly")
+        print("  2. Run 'rpicam-hello' to test Pi Camera")
+        print("  3. Run 'ls /dev/video*' to check available cameras")
+        self.camera = None
             
     def init_hailo_model(self):
         """Initialize Hailo AI model"""
@@ -137,15 +156,22 @@ class BusPassengerCounter:
             
     def get_frame(self):
         """Get a frame from the camera"""
-        if PICAMERA_AVAILABLE and isinstance(self.camera, Picamera2):
-            frame = self.camera.capture_array()
-            # Convert RGB to BGR for OpenCV
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            return frame
-        else:
-            ret, frame = self.camera.read()
-            if ret:
+        if self.camera is None:
+            return None
+            
+        try:
+            if self.use_picamera and isinstance(self.camera, Picamera2):
+                frame = self.camera.capture_array()
+                # Convert RGB to BGR for OpenCV
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 return frame
+            else:
+                ret, frame = self.camera.read()
+                if ret and frame is not None:
+                    return frame
+        except Exception as e:
+            print(f"Error getting frame: {e}")
+            
         return None
         
     def detect_persons(self, frame):
@@ -314,37 +340,41 @@ class BusPassengerCounter:
         """Clean up resources and save results"""
         end_time = datetime.now()
         
-        # Save results to JSON
-        counts = self.counter.get_counts()
-        save_results(
-            OUTPUT_JSON_FILE,
-            counts["in"],
-            counts["out"],
-            self.start_time,
-            end_time,
-            self.events
-        )
+        # Save results to JSON (only if we have a start time)
+        if self.start_time:
+            counts = self.counter.get_counts()
+            save_results(
+                OUTPUT_JSON_FILE,
+                counts["in"],
+                counts["out"],
+                self.start_time,
+                end_time,
+                self.events
+            )
+            
+            # Print summary
+            print("\n" + "="*50)
+            print("SESSION SUMMARY")
+            print("="*50)
+            print(f"Duration: {end_time - self.start_time}")
+            print(f"Total IN: {counts['in']}")
+            print(f"Total OUT: {counts['out']}")
+            print(f"Current in bus: {counts['current_in_bus']}")
+            print(f"Results saved to: {OUTPUT_JSON_FILE}")
+            print("="*50)
         
         # Close camera
-        if PICAMERA_AVAILABLE and isinstance(self.camera, Picamera2):
-            self.camera.stop()
-            self.camera.close()
-        elif self.camera is not None:
-            self.camera.release()
+        try:
+            if self.use_picamera and isinstance(self.camera, Picamera2):
+                self.camera.stop()
+                self.camera.close()
+            elif self.camera is not None:
+                self.camera.release()
+        except Exception as e:
+            print(f"Error closing camera: {e}")
             
         # Close display window
         cv2.destroyAllWindows()
-        
-        # Print summary
-        print("\n" + "="*50)
-        print("SESSION SUMMARY")
-        print("="*50)
-        print(f"Duration: {end_time - self.start_time}")
-        print(f"Total IN: {counts['in']}")
-        print(f"Total OUT: {counts['out']}")
-        print(f"Current in bus: {counts['current_in_bus']}")
-        print(f"Results saved to: {OUTPUT_JSON_FILE}")
-        print("="*50)
         
     def run(self):
         """Main loop"""
@@ -359,9 +389,19 @@ class BusPassengerCounter:
         print("Press 'r' to reset counts")
         print("="*50 + "\n")
         
+        # Check if camera is available
+        if self.camera is None:
+            print("Error: No camera available! Exiting...")
+            self.cleanup()
+            return
+        
         # Start camera if Pi Camera
-        if PICAMERA_AVAILABLE and isinstance(self.camera, Picamera2):
+        if self.use_picamera and isinstance(self.camera, Picamera2):
             self.camera.start()
+            time.sleep(0.5)  # Wait for camera to warm up
+            
+        frame_error_count = 0
+        max_frame_errors = 50  # Stop after 50 consecutive errors
             
         fps_counter = 0
         fps_start_time = time.time()
@@ -371,9 +411,17 @@ class BusPassengerCounter:
             # Get frame
             frame = self.get_frame()
             if frame is None:
-                print("Error: Could not get frame")
+                frame_error_count += 1
+                if frame_error_count >= max_frame_errors:
+                    print(f"Error: Too many frame errors ({frame_error_count}). Stopping...")
+                    break
+                if frame_error_count % 10 == 1:
+                    print(f"Warning: Could not get frame (error #{frame_error_count})")
                 time.sleep(0.1)
                 continue
+            
+            # Reset error count on successful frame
+            frame_error_count = 0
                 
             # Process frame
             frame, boxes, objects, count_in, count_out = self.process_frame(frame)
