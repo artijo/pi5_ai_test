@@ -1,0 +1,18 @@
+# Bus Passenger Counter - Requirements
+# For Raspberry Pi 5 + AI Kit (Hailo-8L)
+
+# Core dependencies
+numpy>=1.24.0
+opencv-python>=4.8.0
+scipy>=1.11.0
+
+# Pi Camera (installed via apt on Raspberry Pi OS)
+# picamera2
+
+# Hailo Runtime (installed separately on Raspberry Pi)
+# hailo-platform
+# hailo-tappas
+
+# Optional - for development/testing without Pi
+# Use these on non-Pi systems for testing
+opencv-contrib-python>=4.8.0
